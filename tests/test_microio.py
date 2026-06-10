@@ -1,0 +1,184 @@
+import asyncio, time
+
+import pytest
+
+from microio import (ActorCore, BrokenResourceError, CancelScope, ClosedResourceError, CloseScope, EndOfStream, LoopServiceThread, Mailbox, ReplyHandle,
+    RequestRegistry, ServiceGroup, ServiceThread, checkpoint, create_channel, create_task_group, fail_after, move_on_after, sleep)
+
+
+def test_close_scope():
+    scope = CloseScope()
+    assert scope.close("done") is True
+    assert scope.close("again") is False
+    assert scope.closed
+    with pytest.raises(ClosedResourceError): scope.raise_if_closed()
+
+    scope = CloseScope()
+    err = ValueError("boom")
+    assert scope.fail(err) is True
+    assert scope.failed
+    with pytest.raises(BrokenResourceError): scope.raise_if_closed()
+
+
+def test_request_registry():
+    reg = RequestRegistry()
+    waiter = reg.register("a")
+    assert reg.resolve("a", {"ok": True}) is True
+    assert reg.wait("a", waiter, timeout=0.1) == {"ok": True}
+    assert len(reg) == 0
+
+    waiter = reg.register("b")
+    with pytest.raises(TimeoutError): reg.wait("b", waiter, timeout=0.01)
+    assert len(reg) == 0
+
+    waiter = reg.register("c")
+    assert reg.fail_all(RuntimeError("closed")) == 1
+    with pytest.raises(RuntimeError): reg.wait("c", waiter, timeout=0.1)
+
+    waiter = reg.register("d")
+    waiter.put("manual")
+    assert reg.wait("d", waiter, timeout=0.1) == "manual"
+    assert "d" not in reg
+
+    assert reg.request("e", lambda reply: reply.resolve("wrapped"), timeout=0.1) == "wrapped"
+    with pytest.raises(ValueError): reg.request("f", lambda reply: (_ for _ in ()).throw(ValueError("send failed")), timeout=0.1)
+    assert "f" not in reg
+
+    reply = reg.reply("g")
+    assert isinstance(reply, ReplyHandle)
+    assert reply.resolve("handled") is True
+    assert reply.wait(timeout=0.1) == "handled"
+
+
+def test_object_channel():
+    send, recv = create_channel()
+    send.send_nowait("before")
+
+    async def _run():
+        recv.bind()
+        assert await recv.receive() == "before"
+        send.send_nowait("after")
+        assert await recv.receive() == "after"
+        send.close()
+        with pytest.raises(EndOfStream): await recv.receive()
+        seen = []
+        async for item in recv: seen.append(item)
+        assert seen == []
+
+    asyncio.run(_run())
+    with pytest.raises(ClosedResourceError): send.send_nowait("late")
+
+    send, recv = create_channel(late_send="drop")
+    send.close()
+    assert send.send_nowait("late") is None
+    assert send.stats().dropped == 1
+
+    send, recv = create_channel()
+    send.fail(ValueError("closed badly"))
+    assert recv.drain_nowait() == []
+    async def _fails():
+        with pytest.raises(ValueError): await recv.receive()
+    asyncio.run(_fails())
+
+
+def test_mailbox_actor_core():
+    async def _run():
+        seen = []
+        async def handle(item):
+            await sleep(0)
+            seen.append(item)
+        actor = ActorCore(handle, mailbox=Mailbox())
+        actor.submit("before-bind")
+        task = asyncio.create_task(actor.run())
+        actor.submit("after-bind")
+        await sleep(0.01)
+        assert actor.drain_nowait() == []
+        assert actor.close()
+        await task
+        assert seen == ["before-bind", "after-bind"]
+        assert actor.submit("late") is None
+
+    asyncio.run(_run())
+
+
+def test_task_group_cancel_scope():
+    async def _run():
+        events = []
+        async def worker(label):
+            try:
+                while True:
+                    events.append(("tick", label))
+                    await sleep(0.01)
+            finally: events.append(("stop", label))
+
+        async with create_task_group() as tg:
+            tg.start_soon(worker, "a")
+            tg.start_soon(worker, "b")
+            await sleep(0.02)
+            assert tg.cancel()
+        assert ("stop", "a") in events and ("stop", "b") in events
+
+        async with create_task_group() as tg:
+            async def service(*, task_status):
+                task_status.started("ready")
+                await sleep(1)
+            assert await tg.start(service) == "ready"
+            tg.cancel()
+
+        with CancelScope() as scope:
+            scope.cancel()
+            await checkpoint()
+            raise AssertionError("checkpoint should cancel")
+        assert scope.cancelled_caught
+
+        with move_on_after(0.01) as scope: await sleep(1)
+        assert scope.cancelled_caught and scope.timed_out
+
+        with pytest.raises(TimeoutError):
+            with fail_after(0.01): await sleep(1)
+
+        with pytest.raises(ExceptionGroup):
+            async with create_task_group() as tg: tg.start_soon(lambda: (_ for _ in ()).throw(ValueError("boom")))
+
+    asyncio.run(_run())
+
+
+def test_service_thread():
+    def target(svc):
+        svc.started()
+        while not svc.scope.closed: time.sleep(0.01)
+
+    svc = ServiceThread(name="svc", target=target)
+    group = ServiceGroup(svc).start().wait_started(timeout=1)
+    assert group.stop_join(timeout=1)
+
+    def fails(svc): raise ValueError("boom")
+
+    svc = ServiceThread(name="bad-svc", target=fails)
+    svc.start()
+    with pytest.raises(RuntimeError): svc.wait_started(timeout=1)
+    assert svc.exc is not None
+    assert svc.join_or_log(timeout=1)
+
+
+def test_loop_service_thread():
+    class Worker(LoopServiceThread):
+        async def run_async(self):
+            self.events = []
+            async def child():
+                try:
+                    while True: await sleep(0.01)
+                finally: self.events.append("child stopped")
+            self.task_group.start_soon(child)
+            self.started()
+            while not self.scope.closed: await sleep(0.01)
+
+    worker = Worker(name="loop-worker")
+    worker.start()
+    worker.wait_started(timeout=1)
+    assert worker.call_sync(lambda x: x + 1, 41, timeout=1) == 42
+    fut = worker.submit(asyncio.sleep(0, result=42))
+    assert fut.result(timeout=1) == 42
+    assert worker.stop()
+    assert worker.join_or_log(timeout=1)
+    assert worker.events == ["child stopped"]

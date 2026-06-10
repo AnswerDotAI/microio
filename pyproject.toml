@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "microio"
+dynamic = ["version"]
+description = "Tiny asyncio-first runtime helpers for service threads, loop ownership, channels, and request waiters"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "microio contributors" }]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+]
+
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "fastship",
+  "build",
+  "twine",
+  "pytest",
+]
+
+[project.urls]
+Homepage = "https://github.com/AnswerDotAI/microio"
+
+[tool.setuptools.dynamic]
+version = { attr = "microio.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["microio"]
