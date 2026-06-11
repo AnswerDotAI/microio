@@ -201,6 +201,8 @@ worker.join_or_log(timeout=1)
 
 ## Development
 
+`microio` requires Python 3.11+.
+
 ```bash
 pip install -e .[dev]
 pytest -q

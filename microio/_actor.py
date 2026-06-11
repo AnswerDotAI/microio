@@ -20,7 +20,7 @@ class Mailbox:
 
     def fail(self, exc: BaseException)->bool: return self.send.fail(exc)
 
-    def drain_nowait(self)->list: return self.receive.drain_nowait()
+    def drain_nowait(self, max_items: int | None = None)->list: return self.receive.drain_nowait(max_items=max_items)
 
     def __aiter__(self): return self.receive.__aiter__()
 
@@ -40,7 +40,7 @@ class ActorCore:
 
     def fail(self, exc: BaseException)->bool: return self.mailbox.fail(exc)
 
-    def drain_nowait(self)->list: return self.mailbox.drain_nowait()
+    def drain_nowait(self, max_items: int | None = None)->list: return self.mailbox.drain_nowait(max_items=max_items)
 
     async def run(self, *, bind: bool = True):
         if bind: self.bind()

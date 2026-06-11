@@ -53,10 +53,12 @@ def test_request_registry():
 def test_object_channel():
     send, recv = create_channel()
     send.send_nowait("before")
+    send.send_nowait("before2")
 
     async def _run():
         recv.bind()
-        assert await recv.receive() == "before"
+        assert recv.drain_nowait(max_items=1) == ["before"]
+        assert await recv.receive() == "before2"
         send.send_nowait("after")
         assert await recv.receive() == "after"
         send.close()
@@ -73,10 +75,17 @@ def test_object_channel():
     assert send.send_nowait("late") is None
     assert send.stats().dropped == 1
 
-    send, recv = create_channel()
-    send.fail(ValueError("closed badly"))
-    assert recv.drain_nowait() == []
     async def _fails():
+        send, recv = create_channel()
+        send.fail(ValueError("closed badly"))
+        assert recv.drain_nowait() == []
+        with pytest.raises(ValueError): await recv.receive()
+
+        send, recv = create_channel()
+        send.send_nowait("kept")
+        send.fail(ValueError("closed badly"))
+        recv.bind()
+        assert await recv.receive() == "kept"
         with pytest.raises(ValueError): await recv.receive()
     asyncio.run(_fails())
 
@@ -129,6 +138,11 @@ def test_task_group_cancel_scope():
             scope.cancel()
             await checkpoint()
             raise AssertionError("checkpoint should cancel")
+        assert scope.cancelled_caught
+
+        scope = CancelScope()
+        scope.cancel()
+        with scope: await asyncio.sleep(1)
         assert scope.cancelled_caught
 
         with move_on_after(0.01) as scope: await sleep(1)

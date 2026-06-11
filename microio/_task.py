@@ -14,13 +14,15 @@ def _current_task():
     except RuntimeError: return None
 
 
-def _cancel_task(task):
+def _cancel_task(task, *, wake: bool = False):
     if task is None or task.done(): return
     loop = task.get_loop()
     try: running = asyncio.get_running_loop()
     except RuntimeError: running = None
-    if running is loop: task.cancel()
-    else: loop.call_soon_threadsafe(task.cancel)
+    try:
+        if wake or running is not loop: loop.call_soon_threadsafe(task.cancel)
+        else: task.cancel()
+    except RuntimeError: pass
 
 
 def _uncancel_task(task):
@@ -59,8 +61,7 @@ class CancelScope:
                 return
         cb()
 
-    def cancel(self, reason: str | None = None)->bool:
-        caller = _current_task()
+    def cancel(self, reason: str | None = None, *, wake: bool = False)->bool:
         with self._lock:
             if self.cancel_called: return False
             self.cancel_called = True
@@ -70,8 +71,7 @@ class CancelScope:
             tasks = list(self._tasks)
             callbacks = list(self._callbacks)
         if timeout_handle is not None: timeout_handle.cancel()
-        for task in tasks:
-            if task is not caller: _cancel_task(task)
+        for task in tasks: _cancel_task(task, wake=wake)
         for cb in callbacks: cb()
         return True
 
@@ -92,7 +92,9 @@ class CancelScope:
             if task is not None: self._tasks.add(task)
             self._entries.append((task, token))
             first = len(self._entries) == 1
+            cancelled = self.cancel_called
         if first: self._arm_deadline()
+        if cancelled: _cancel_task(task)
         return self
 
     def _pop_entry(self, task):

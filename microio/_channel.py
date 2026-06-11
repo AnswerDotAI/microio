@@ -122,12 +122,12 @@ class ObjectReceiveChannel:
         with st.lock: st.received += 1
         return item
 
-    def drain_nowait(self)->list:
+    def drain_nowait(self, max_items: int | None = None)->list:
         "Drain currently queued items without awaiting."
         st = self._state
         if st.q is None: return []
         out = []
-        while True:
+        while max_items is None or len(out) < max_items:
             try: item = st.q.get_nowait()
             except asyncio.QueueEmpty: return out
             if item is _closed:
@@ -137,6 +137,7 @@ class ObjectReceiveChannel:
                 st.q.put_nowait(item)
                 return out
             out.append(item)
+        return out
 
     def close(self)->bool: return ObjectSendChannel(self._state).close()
 
