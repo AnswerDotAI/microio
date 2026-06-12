@@ -3,7 +3,7 @@ import asyncio, time
 import pytest
 
 from microio import (ActorCore, BrokenResourceError, CancelScope, ClosedResourceError, CloseScope, EndOfStream, LoopServiceThread, Mailbox, ReplyHandle,
-    RequestRegistry, ServiceGroup, ServiceThread, checkpoint, create_channel, create_task_group, fail_after, move_on_after, sleep)
+    RequestRegistry, ScopeGroup, ServiceGroup, ServiceThread, WorkTracker, checkpoint, create_channel, create_task_group, fail_after, move_on_after, sleep)
 
 
 def test_close_scope():
@@ -196,3 +196,86 @@ def test_loop_service_thread():
     assert worker.stop()
     assert worker.join_or_log(timeout=1)
     assert worker.events == ["child stopped"]
+
+
+def test_actor_core_concurrent_release():
+    async def main():
+        order = []
+        async def handler(item, release):
+            order.append(("start", item))
+            if item == 1:
+                release()
+                await asyncio.sleep(0.02)
+            order.append(("end", item))
+        actor = ActorCore(handler, concurrent=True)
+        for i in (1, 2, 3): actor.submit(i)
+        actor.close()
+        await actor.run()
+        assert order == [("start", 1), ("start", 2), ("end", 2), ("start", 3), ("end", 3), ("end", 1)]
+    asyncio.run(main())
+
+
+def test_actor_core_concurrent_serialized_without_release():
+    async def main():
+        order = []
+        async def handler(item, release):
+            order.append(("start", item))
+            await asyncio.sleep(0.01)
+            order.append(("end", item))
+        actor = ActorCore(handler, concurrent=True)
+        for i in (1, 2): actor.submit(i)
+        actor.close()
+        await actor.run()
+        assert order == [("start", 1), ("end", 1), ("start", 2), ("end", 2)]
+    asyncio.run(main())
+
+
+def test_cancel_scope_enter_cancelled_without_checkpoint():
+    "Entering an already-cancelled scope must not leak a pending cancellation past its exit."
+    async def main():
+        s = CancelScope()
+        s.cancel("pre")
+        with s: pass            # body never reaches a checkpoint
+        await asyncio.sleep(0)  # must not raise CancelledError
+    asyncio.run(main())
+
+
+def test_scope_group():
+    async def main():
+        sg = ScopeGroup()
+        assert not sg.active
+        assert sg.cancel("nothing") is False
+
+        results = []
+        async def work(i):
+            try:
+                with sg.scope(): await sleep(10)
+                results.append((i, "caught"))
+            except asyncio.CancelledError: results.append((i, "cancelled"))
+
+        async with create_task_group() as tg:
+            tg.start_soon(work, 1)
+            tg.start_soon(work, 2)
+            await sleep(0.01)
+            assert sg.active
+            assert sg.cancel("stop", latch=True) is True
+            with sg.scope() as s: assert s.cancelled  # latched: late entrants are cancelled on entry
+            sg.clear()
+            with sg.scope() as s: assert not s.cancelled
+        assert sorted(results) == [(1, "caught"), (2, "caught")]
+        assert not sg.active
+    asyncio.run(main())
+
+
+def test_work_tracker():
+    wt = WorkTracker()
+    assert not wt.busy.is_set() and wt.count == 0
+    with wt.track():
+        assert wt.busy.is_set() and wt.count == 1
+        with wt.track(): assert wt.count == 2
+        assert wt.busy.is_set()
+    assert not wt.busy.is_set() and wt.count == 0
+    wt.add()
+    assert wt.busy.is_set() and wt.count == 1
+    wt.done()
+    assert not wt.busy.is_set() and wt.count == 0

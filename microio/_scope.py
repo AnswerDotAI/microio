@@ -1,4 +1,5 @@
 import threading
+from contextlib import contextmanager
 
 
 class ClosedResourceError(RuntimeError): pass
@@ -42,3 +43,31 @@ class CloseScope:
         if not self.closed: return
         if self.exc is not None: raise BrokenResourceError(self.reason or str(self.exc)) from self.exc
         raise ClosedResourceError(self.reason or "closed")
+
+
+class WorkTracker:
+    "Thread-safe in-flight work counter with a `busy` Event view (a WaitGroup)."
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.count = 0
+        self.busy = threading.Event()
+
+    def add(self):
+        "Record one unit of in-flight work."
+        with self._lock:
+            self.count += 1
+            self.busy.set()
+
+    def done(self):
+        "Record completion of one unit of work."
+        with self._lock:
+            self.count -= 1
+            if self.count == 0: self.busy.clear()
+
+    @contextmanager
+    def track(self):
+        "Track one unit of work for the duration of the block."
+        self.add()
+        try: yield
+        finally: self.done()

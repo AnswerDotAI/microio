@@ -1,6 +1,7 @@
 import inspect
 
 from ._channel import create_channel
+from ._task import create_task_group
 
 
 class Mailbox:
@@ -28,8 +29,11 @@ class Mailbox:
 class ActorCore:
     "Serialized async handler loop over a Mailbox."
 
-    def __init__(self, handler, *, mailbox: Mailbox | None = None):
+    def __init__(self, handler,  # `handler(item)`, or `handler(item, release)` when `concurrent`
+        *, mailbox: Mailbox | None = None,
+        concurrent: bool = False):  # run each item as a task; `release()` lets the next item start early
         self.handler = handler
+        self.concurrent = concurrent
         self.mailbox = mailbox or Mailbox()
 
     def bind(self, loop=None): self.mailbox.bind(loop)
@@ -44,7 +48,20 @@ class ActorCore:
 
     async def run(self, *, bind: bool = True):
         if bind: self.bind()
-        async for item in self.mailbox: await self.handle(item)
+        if not self.concurrent:
+            async for item in self.mailbox: await self.handle(item)
+            return
+        async with create_task_group() as tg:
+            async for item in self.mailbox: await tg.start(self._handle_release, item)
+
+    async def _handle_release(self, item, *, task_status):
+        "Run `handler(item, release)`; the next item is processed once `release()` is called or the handler returns."
+        def release():
+            if not task_status.started_called: task_status.started()
+        try:
+            res = self.handler(item, release)
+            if inspect.isawaitable(res): await res
+        finally: release()
 
     async def handle(self, item):
         res = self.handler(item)

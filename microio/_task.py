@@ -1,4 +1,5 @@
 import asyncio, contextvars, inspect, threading
+from contextlib import contextmanager
 
 _scope_stack = contextvars.ContextVar("microio_cancel_scopes", default=())
 
@@ -45,6 +46,7 @@ class CancelScope:
         self._entries = []
         self._callbacks = []
         self._timeout_handle = None
+        self._pending_cancels = {}  # task -> undelivered cancellations issued by this scope
 
     @property
     def cancelled(self)->bool:
@@ -71,9 +73,21 @@ class CancelScope:
             tasks = list(self._tasks)
             callbacks = list(self._callbacks)
         if timeout_handle is not None: timeout_handle.cancel()
-        for task in tasks: _cancel_task(task, wake=wake)
+        for task in tasks: self._issue_cancel(task, wake=wake)
         for cb in callbacks: cb()
         return True
+
+    def _issue_cancel(self, task, *, wake: bool = False):
+        "Cancel `task`, recording the issue so an undelivered cancellation can be retracted at scope exit."
+        if task is None or task.done(): return
+        with self._lock: self._pending_cancels[task] = self._pending_cancels.get(task, 0) + 1
+        _cancel_task(task, wake=wake)
+
+    def _retract_pending(self, task):
+        "Withdraw undelivered cancellations this scope issued to `task`."
+        if task is None: return
+        with self._lock: n = self._pending_cancels.pop(task, 0)
+        for _ in range(n): _uncancel_task(task)
 
     def _arm_deadline(self):
         loop = asyncio.get_running_loop()
@@ -94,7 +108,7 @@ class CancelScope:
             first = len(self._entries) == 1
             cancelled = self.cancel_called
         if first: self._arm_deadline()
-        if cancelled: _cancel_task(task)
+        if cancelled: self._issue_cancel(task)
         return self
 
     def _pop_entry(self, task):
@@ -114,6 +128,7 @@ class CancelScope:
             if not self.cancel_called: return False
             self.cancelled_caught = True
             raise_timeout, timed_out = self.raise_timeout, self.timed_out
+            if task is not None and self._pending_cancels.get(task, 0) > 0: self._pending_cancels[task] -= 1
         _uncancel_task(task)
         if raise_timeout and timed_out: raise TimeoutError("operation timed out") from exc
         return True
@@ -124,6 +139,7 @@ class CancelScope:
         _scope_stack.reset(token)
         if timeout_handle is not None: timeout_handle.cancel()
         if exc_type is not None and issubclass(exc_type, asyncio.CancelledError): return self._suppress_cancelled(task, exc)
+        self._retract_pending(task)
         return False
 
 
@@ -158,6 +174,36 @@ def move_on_after(delay: float)->CancelScope: return CancelScope(delay=delay)
 
 
 def fail_after(delay: float)->CancelScope: return CancelScope(delay=delay, raise_timeout=True)
+
+
+class ScopeGroup:
+    "Live registry of CancelScopes: enter cancellable regions via scope(), cancel them all from any thread."
+
+    def __init__(self):
+        self._scopes = ()        # copy-on-write: written by entering tasks, read lock-free from signal/control paths
+        self.cancelling = False  # latch: scopes entered while set are cancelled on entry
+
+    @contextmanager
+    def scope(self):
+        "Enter a fresh CancelScope registered with the group."
+        s = CancelScope()
+        self._scopes += (s,)
+        if self.cancelling: s.cancel("cancelled")
+        try:
+            with s: yield s
+        finally: self._scopes = tuple(x for x in self._scopes if x is not s)
+
+    def cancel(self, reason: str | None = None, *, wake: bool = False, latch: bool = False)->bool:
+        "Cancel all registered scopes; with `latch`, also cancel scopes entered later (until clear())."
+        if latch: self.cancelling = True
+        ok = False
+        for s in self._scopes: ok = (s.cancelled or s.cancel(reason, wake=wake)) or ok
+        return ok
+
+    def clear(self): self.cancelling = False
+
+    @property
+    def active(self)->bool: return bool(self._scopes)
 
 
 class TaskStatus:
