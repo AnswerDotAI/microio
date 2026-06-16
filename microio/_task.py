@@ -255,13 +255,13 @@ class TaskGroup:
     def _cancel_group(self):
         if self._tg is None or self._loop is None: return
         if _current_task() is self._owner_task: return
-        def _create_cancel_task():
-            try: self._tg.create_task(_raise_task_group_cancel())
-            except RuntimeError: pass
+        def _create_cancel_task(): self._tg.create_task(_raise_task_group_cancel())
         try: running = asyncio.get_running_loop()
         except RuntimeError: running = None
-        if running is self._loop: _create_cancel_task()
-        else: self._loop.call_soon_threadsafe(_create_cancel_task)
+        try:
+            if running is self._loop: _create_cancel_task()
+            else: self._loop.call_soon_threadsafe(_create_cancel_task)
+        except RuntimeError: pass
 
     def cancel(self, reason: str | None = None)->bool: return self.cancel_scope.cancel(reason=reason)
 
