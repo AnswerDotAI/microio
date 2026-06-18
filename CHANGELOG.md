@@ -1,5 +1,12 @@
 <!-- do not remove -->
 
+## 0.1.2
+
+### Bugs Squashed
+
+- Guard `_cancel_group` against closed/absent event loop ([#3](https://github.com/AnswerDotAI/microio/pull/3)), thanks to [@PiotrCzapla](https://github.com/PiotrCzapla)
+
+
 ## 0.1.1
 
 ### New Features
