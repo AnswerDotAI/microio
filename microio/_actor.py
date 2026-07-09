@@ -28,10 +28,13 @@ class Mailbox:
 
 class ActorCore:
     "Serialized async handler loop over a Mailbox."
-
-    def __init__(self, handler,  # `handler(item)`, or `handler(item, release)` when `concurrent`
-        *, mailbox: Mailbox | None = None,
-        concurrent: bool = False):  # run each item as a task; `release()` lets the next item start early
+    def __init__(
+        self,
+        handler,  # `handler(item)`, or `handler(item, release)` when `concurrent`
+        *,
+        mailbox: Mailbox | None = None,
+        concurrent: bool = False # run each item as a task; `release()` lets the next item start early
+    ):
         self.handler = handler
         self.concurrent = concurrent
         self.mailbox = mailbox or Mailbox()
