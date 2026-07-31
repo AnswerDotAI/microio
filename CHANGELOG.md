@@ -1,6 +1,6 @@
 <!-- do not remove -->
 
-## 0.1.2
+## 0.1.3
 
 ### Bugs Squashed
 
@@ -18,4 +18,3 @@
 ## 0.1.0
 
 - Init release
-
