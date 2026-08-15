@@ -2,7 +2,7 @@ import asyncio, time
 
 import pytest
 
-from microio import (ActorCore, BrokenResourceError, CancelScope, ClosedResourceError, CloseScope, EndOfStream, LoopServiceThread, Mailbox, ReplyHandle,
+from microio import (ActorCore, PriorityMailbox, BrokenResourceError, CancelScope, ClosedResourceError, CloseScope, EndOfStream, LoopServiceThread, Mailbox, ReplyHandle,
     RequestRegistry, ScopeGroup, ServiceGroup, ServiceThread, WorkTracker, checkpoint, create_channel, create_task_group, fail_after, move_on_after, sleep)
 
 
@@ -279,3 +279,51 @@ def test_work_tracker():
     assert wt.busy.is_set() and wt.count == 1
     wt.done()
     assert not wt.busy.is_set() and wt.count == 0
+
+
+def test_priority_mailbox():
+    async def _run():
+        mb = PriorityMailbox(key=lambda o: o[0])
+        for o in [(0,'a'), (2,'b'), (1,'c'), (2,'d')]: mb.submit(o)
+        await sleep(0)
+        assert [await mb.get() for _ in range(4)] == [(2,'b'), (2,'d'), (1,'c'), (0,'a')]
+        mb.floor = 0
+        mb.submit((0,'parked'))
+        mb.submit((1,'runs'))
+        assert await mb.get() == (1,'runs')
+        got = []
+        async def getter(): got.append(await mb.get())
+        t = asyncio.create_task(getter())
+        await sleep(0.01)
+        assert not got, "floored item must not be yielded"
+        mb.floor = None
+        await sleep(0.01)
+        assert got == [(0,'parked')], "lifting the floor must wake the waiter"
+        await t
+        mb.floor = 0
+        mb.submit((0,'stranded'))
+        await sleep(0)
+        assert mb.drain_nowait() == [(0,'stranded')], "drain ignores the floor"
+        mb.close()
+
+    asyncio.run(_run())
+
+
+def test_priority_mailbox_actor():
+    async def _run():
+        seen = []
+        async def handle(item, release):
+            release()
+            seen.append(item)
+        actor = ActorCore(handle, mailbox=PriorityMailbox(key=lambda o: o[0]), concurrent=True)
+        task = asyncio.create_task(actor.run())
+        actor.submit((0,'a'))
+        await sleep(0.01)  # (0,'a') starts; anything still queued can be jumped
+        for o in [(0,'c'), (1,'b')]: actor.submit(o)
+        await sleep(0.05)
+        actor.close()
+        await task
+        assert seen[0] == (0,'a'), "first item starts before later submissions can jump it"
+        assert seen[1:] == [(1,'b'), (0,'c')]
+
+    asyncio.run(_run())

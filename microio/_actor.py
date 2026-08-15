@@ -1,6 +1,7 @@
-import inspect
+import heapq, inspect
 
 from ._channel import create_channel
+from ._scope import EndOfStream
 from ._task import create_task_group
 
 
@@ -25,6 +26,61 @@ class Mailbox:
 
     def __aiter__(self): return self.receive.__aiter__()
 
+
+_poke = object()
+_nothing = object()
+
+class PriorityMailbox(Mailbox):
+    "Mailbox yielding the highest-priority item first (FIFO within a level), with a floor that parks items at or below it."
+
+    def __init__(self,
+        key=None, # `key(item)` returns the item's priority (default 0); higher is served first
+        gate=None, # `gate(item)` sees each item as it leaves the channel, in arrival order; returning False consumes it
+        **kw):
+        super().__init__(**kw)
+        self.key = key or (lambda item: 0)
+        self.gate = gate
+        self._heap, self._seq, self._floor = [], 0, None
+
+    @property
+    def floor(self): return self._floor
+
+    @floor.setter
+    def floor(self, v):
+        "Yield only items with priority strictly above `v`; None lifts the floor. Set from the receive loop's own thread."
+        self._floor = v
+        self.send.send_nowait(_poke)  # wake a parked `get`; drops silently if closed
+
+    def _push(self, item):
+        if item is _poke: return
+        if self.gate is not None and not self.gate(item): return
+        self._seq += 1
+        heapq.heappush(self._heap, (-self.key(item), self._seq, item))
+
+    def _pop(self):
+        if not self._heap: return _nothing
+        prio = -self._heap[0][0]
+        if self._floor is not None and prio <= self._floor: return _nothing
+        return heapq.heappop(self._heap)[2]
+
+    async def get(self):
+        while True:
+            for item in self.receive.drain_nowait(): self._push(item)
+            if (got := self._pop()) is not _nothing: return got
+            self._push(await self.receive.receive())
+
+    def drain_nowait(self, max_items: int | None = None)->list:
+        "Drain queued items in priority order, ignoring the floor: draining is for teardown and aborts."
+        for item in self.receive.drain_nowait(): self._push(item)
+        out = []
+        while self._heap and (max_items is None or len(out) < max_items): out.append(heapq.heappop(self._heap)[2])
+        return out
+
+    def __aiter__(self): return self
+
+    async def __anext__(self):
+        try: return await self.get()
+        except EndOfStream: raise StopAsyncIteration from None
 
 class ActorCore:
     "Serialized async handler loop over a Mailbox."

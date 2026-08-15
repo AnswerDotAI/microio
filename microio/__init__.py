@@ -4,7 +4,7 @@ __version__ = "0.1.4"
 
 
 
-from ._actor import ActorCore, Mailbox
+from ._actor import ActorCore, Mailbox, PriorityMailbox
 from ._channel import ChannelStats, ObjectReceiveChannel, ObjectSendChannel, create_channel
 from ._registry import ReplyHandle, RequestRegistry
 from ._scope import BrokenResourceError, ClosedResourceError, CloseScope, EndOfStream, WorkTracker
