@@ -1,5 +1,12 @@
 <!-- do not remove -->
 
+## 0.1.4
+
+### New Features
+
+- Add PriorityMailbox: priority-ordered mailbox with FIFO tie-breaks, optional gate filter, and a floor to park low-priority items ([#4](https://github.com/AnswerDotAI/microio/issues/4))
+
+
 ## 0.1.3
 
 ### Bugs Squashed
