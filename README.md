@@ -1,49 +1,52 @@
 # microio
 
-Small, dependency-free tools for programs that mix **threads and asyncio** — where data, cancellation, and failure have to cross the thread/event-loop boundary without races, hangs, or silent loss.
+Small, dependency-free tools for programs that mix threads and asyncio. They handle data transfer, cancellation, failure reporting, and service startup and shutdown across the thread/event-loop boundary.
 
 ## The problem
 
-Real programs are rarely purely async. A typical shape: one thread owns an event loop doing the interesting work, while other threads — a socket reader, a control channel, the main thread, sometimes a *signal handler* — need to:
+A program may run an event loop in one thread while a socket reader, a control channel, or the main thread needs to:
 
-- **feed it work** (without touching the loop from the wrong thread),
-- **cancel work it's doing** (without killing the loop, and without the cancellation leaking somewhere unrelated),
-- **block waiting for an answer** from it (and get woken with an error, not hang forever, if it dies),
-- **know it started up properly**, and **know it actually shut down**.
+- Send work to the loop from another thread.
+- Cancel that work while keeping the loop running and leaving unrelated work unaffected.
+- Block waiting for an answer, and wake with an error if the service fails.
+- Check that the service started successfully and that it shut down when asked.
 
-The stdlib gives you the raw ingredients — `call_soon_threadsafe`, `run_coroutine_threadsafe`, `Thread`, `Queue` — and leaves all of the above as an exercise. That exercise is where deadlocks, dropped messages, zombie threads, and "it stopped responding but the process looks fine" bugs live.
+The standard library provides `call_soon_threadsafe`, `run_coroutine_threadsafe`, `Thread`, and `Queue`. Combining them requires handling startup, cancellation, failure, and shutdown across threads. Mistakes can cause deadlocks, dropped messages, threads that never exit, or a service that stops responding while its process keeps running.
 
-[Trio](https://trio.readthedocs.io/) and [AnyIO](https://anyio.readthedocs.io/) solve concurrency beautifully, but *inside* one async world: they assume the code in control is itself async. When the thing doing the cancelling is another thread — or a SIGINT handler that must not take any locks — you're back on your own.
+[Trio](https://trio.readthedocs.io/en/stable/reference-core.html#getting-back-into-the-trio-thread-from-another-thread) and [AnyIO](https://anyio.readthedocs.io/en/stable/threads.html) provide structured concurrency and APIs for calling into their event loops from external threads. AnyIO's blocking portals can also own a loop in a background thread and let synchronous callers start tasks, wait for readiness, and cancel them.
 
-microio is that missing layer: ~800 lines, stdlib only, asyncio only, Python 3.11+.
+microio focuses on asyncio programs that need thread-callable channels and cancellation scopes, supervised service threads, and request/reply bookkeeping. These primitives can be used individually with an existing asyncio loop. The implementation is about 950 lines, uses only the standard library, and requires Python 3.11+.
 
-## What's in the box
+microio was extracted from a Jupyter kernel. A protocol thread fed an execution loop, Ctrl-C needed to cancel a coroutine on another thread, and clients could disconnect while a request was waiting for a reply. The same coordination problems occur in other threaded services.
 
-**Move data across the boundary**
+## Tools
 
-- `create_channel()` — a sender usable from any thread (even before the loop exists), an async receiver with `async for`, and explicit close/fail semantics that *wake* the receiver rather than strand it.
-- `Mailbox` / `ActorCore` — the channel wrapped into the common actor shape: thread-safe `submit()`, one-at-a-time async handling.
+### Sending data between threads and an event loop
 
-**Move control across the boundary**
+- `create_channel()` provides a sender usable from any thread, even before the loop exists, and an async receiver supporting `async for`. Closing or failing the channel wakes the receiver.
+- `Mailbox` wraps the channel with thread-safe `submit()` and async receive. `ActorCore` adds one-at-a-time async message handling.
 
-- `CancelScope` — trio-style cancellation scopes for asyncio, cancellable **from any thread**. A scope that cancels its own region cleanly catches the cancellation at its exit; an issued-but-undelivered cancellation is retracted, never leaked into unrelated code.
-- `ScopeGroup` — a live registry of cancellable regions: enter with `scope()`, cancel them *all* from anywhere with `cancel()`. The `latch` option also cancels regions entered just after the cancel — closing the classic check-then-act race. Lock-free reads, so it's safe to call from a signal handler.
-- `CloseScope` — thread-safe "we are stopping, here's why" state, closable exactly once.
-- `WorkTracker` — a WaitGroup: in-flight work counter with a `busy` Event any thread can check or wait on.
+### Cancellation and shutdown state
 
-**Wait across the boundary**
+- `CancelScope` provides Trio-style cancellation scopes for asyncio, cancellable from any thread. It catches cancellation of its own region at scope exit and retracts issued-but-undelivered cancellation so it does not affect subsequent code.
+- `ScopeGroup` tracks cancellable regions entered with `scope()`. Calling `cancel()` from another thread cancels all registered regions. With `latch=True`, it also cancels regions entered later, until `clear()` is called, covering work that starts just after the cancellation request.
+- `CloseScope` records thread-safe close/failure state and its reason. Only the first close changes the state.
+- `WorkTracker` is a WaitGroup-style counter for in-flight work. Its `busy` Event is set while work is in progress; any thread can check it or wait for it to become set.
 
-- `RequestRegistry` — request/reply bookkeeping between threads: register, block with timeout, resolve from the reader thread, and — the part hand-rolled versions always miss — `fail_all()` so that when the connection dies, every blocked waiter gets the exception instead of hanging forever.
+### Waiting for replies from another thread
 
-**Own your threads properly**
+- `RequestRegistry` handles request/reply bookkeeping: register a request, block with a timeout, and resolve it from the reader thread. Call `fail_all()` when the connection dies to wake all pending waiters with the exception.
 
-- `ServiceThread` — a supervised thread: it reports `started()` or its parent's `wait_started()` raises the real startup exception; `stop()` is durable state, not a flag a loop might miss; `join_or_log()` never silently ignores a join timeout.
-- `LoopServiceThread` — a `ServiceThread` that owns an `asyncio.Runner`: `submit(coro)` and `call_sync(fn)` from any thread, structured shutdown of its child tasks.
-- `ServiceGroup` — start/wait/stop/join a set of services without boilerplate.
+### Managing service threads
 
-**Structured async (the in-loop part)**
+- `ServiceThread` supervises a thread's lifecycle. The service reports readiness with `started()`; startup failures reach the parent through `wait_started()`, with the original exception as the cause. `stop()` records a persistent stop request, and `join_or_log()` logs a join timeout.
+- `LoopServiceThread` is a `ServiceThread` that owns an `asyncio.Runner`. It accepts `submit(coro)` and `call_sync(fn)` from other threads and manages shutdown of its child tasks.
+- `ServiceGroup` starts, waits for readiness, stops, and joins a set of services.
 
-- `TaskGroup` (wrapping `asyncio.TaskGroup`) with `start_soon`, `await tg.start(...)`/`task_status.started()` readiness, and group cancellation that works from other threads; `move_on_after`, `fail_after`, `checkpoint`, `sleep`.
+### Structured concurrency within the event loop
+
+- `TaskGroup` wraps `asyncio.TaskGroup` with `start_soon`, readiness reporting through `await tg.start(...)` and `task_status.started()`, and group cancellation callable from other threads.
+- `move_on_after` and `fail_after` provide timeout scopes. `checkpoint` and `sleep` check for cancellation as well as yielding to the loop.
 
 ## Examples
 
@@ -66,7 +69,7 @@ async def main():
 asyncio.run(main())
 ```
 
-### A background thread that owns a loop — with checked startup and shutdown
+### A background event loop with checked startup and shutdown
 
 ```python
 from microio import LoopServiceThread, sleep
@@ -86,9 +89,9 @@ svc.stop()
 svc.join_or_log(timeout=2)                     # a join timeout is logged, never swallowed
 ```
 
-Half of debugging multithreaded programs is finding the thread that died quietly at startup, or never exited at shutdown. `ServiceThread` makes both loud.
+The parent waits for an explicit readiness report before submitting work. Startup failures retain the original traceback, and a thread that fails to stop is reported by `join_or_log()`.
 
-### Cancelling async work from another thread (or a signal handler)
+### Cancelling async work from another thread
 
 ```python
 from microio import ScopeGroup, sleep
@@ -100,13 +103,15 @@ async def job():
         await do_work()
     if scope.cancelled_caught: print("interrupted; cleaning up")
 
-# meanwhile, from ANY other thread — or a SIGINT handler (no locks taken):
-scopes.cancel("user interrupt", latch=True)    # latch also catches a job that is *just* starting
+# from another thread:
+scopes.cancel("user interrupt", latch=True)    # also cancels jobs that enter a scope later
 ```
 
-The cancellation lands inside the `with` block and is caught at its exit — the task survives, follow-up code (sending an error reply, releasing resources) still runs, and nothing leaks to other tasks.
+Each scope catches its cancellation at the end of the `with` block. The task can then send an error reply or release resources and continue running. Tasks outside the group are unaffected. Call `scopes.clear()` when new jobs should be allowed to run again.
 
-### Serialized message handling, with an escape hatch
+`ScopeGroup` reads its registry without a lock, but cancellation acquires locks in the individual scopes. Do not call it directly from a signal handler that must avoid locks. Instead, schedule the cancellation on the running loop with [`loop.call_soon_threadsafe()`](https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.call_soon_threadsafe). Close and stop operations also acquire locks; thread safety does not imply signal-handler safety.
+
+### Serialized message handling with per-message concurrency
 
 ```python
 from microio import ActorCore
@@ -118,20 +123,20 @@ actor.submit(msg)                              # thread-safe, from anywhere
 await actor.run()                              # in the loop that owns the actor
 ```
 
-When a handler needs to let the queue keep moving while it waits on something slow, `concurrent=True` hands each handler a release baton:
+With `concurrent=True`, each handler receives a `release` callback. Calling it allows the next message to start before the current handler finishes, so handlers can preserve ordering during preparation and overlap slow I/O:
 
 ```python
 async def handle(msg, release):
     prepare(msg)            # this part stays strictly ordered
-    release()               # from here on, the next message may start...
-    await slow_io(msg)      # ...it actually runs whenever this one suspends
+    release()               # allows the next message to start
+    await slow_io(msg)      # yields so the next handler can run
 
 actor = ActorCore(handle, concurrent=True)
 ```
 
-Handlers that never call `release()` behave exactly like the serialized actor — ordering is opt-out per message, not a global mode.
+If a handler never calls `release()`, the next message waits for that handler to finish. Enabling `concurrent=True` lets each handler choose when to permit overlap.
 
-### Request/reply that can't hang
+### Waking pending requesters when a connection fails
 
 ```python
 from microio import RequestRegistry
@@ -158,17 +163,15 @@ python examples/counter_server.py
 
 ## Design rules
 
-- **Failures are loud.** Startup errors reach the parent with their traceback; join timeouts are logged; dead readers wake their waiters with the real exception.
-- **Closing is a durable state with a reason**, not a one-shot flag an operation might miss. Everything closes exactly once.
-- **Control may come from anywhere.** Cancellation, close, and stop are safe from other threads, and the read paths are lock-free so they're safe from signal handlers.
-- **Ownership is explicit.** A loop, socket, or receiver belongs to one thread; everyone else talks to it through these primitives.
+- Startup errors reach the parent with their traceback, and join timeouts are logged. Reader threads use `fail_all()` to wake pending requesters with the failure exception.
+- Close state persists so later operations can observe it. `CloseScope` retains the reason or failure exception, and repeated close calls leave the original state unchanged.
+- Cancellation, close, and stop can be requested from other threads. Signal handlers must defer operations that acquire locks, as described in the cancellation example.
+- Each loop, socket, or receiver belongs to one thread. Other threads communicate with it through these primitives.
 
-## What microio is not
+## Scope and limitations
 
-- Not an AnyIO replacement: asyncio only, no networking or file APIs, no shielding, single-receiver channels. If your whole program is async, use AnyIO — it's excellent, and microio's scope/readiness design borrows directly from [its ideas][anyio-why].
-- Cancellation is still asyncio cancellation: raw `await`s follow asyncio's edge-triggered rules; microio's `checkpoint()`/`sleep()` add level-triggered behavior where you opt in.
-
-microio was extracted from a Jupyter kernel, where all of these problems show up at once: a protocol thread feeding an execution loop, Ctrl-C arriving as a signal that must cancel a coroutine on another thread, and clients that disconnect while something is blocked waiting on them. The primitives are general; that's just the crucible they were forged in.
+- microio supports asyncio only. It has no networking or file APIs, no cancellation shielding, and its channels have a single receiver. If your whole program is async, use AnyIO — it's excellent, and microio's scope/readiness design borrows directly from [its ideas][anyio-why].
+- Raw `await`s follow asyncio's edge-triggered cancellation rules. microio's `checkpoint()` and `sleep()` add level-triggered behavior where used: they check for cancellation on each call, even if an earlier cancellation exception was caught.
 
 ## Development
 
@@ -177,6 +180,6 @@ pip install -e .[dev]
 pytest -q
 ```
 
-Version lives in `microio/__init__.py` as `__version__`.
+The version is defined in `microio/__init__.py` as `__version__`.
 
 [anyio-why]: https://anyio.readthedocs.io/en/stable/why.html
